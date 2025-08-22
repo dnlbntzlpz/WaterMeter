@@ -1,0 +1,72 @@
+.metric-card {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    border-radius: 15px;
+    padding: 20px;
+    margin-bottom: 20px;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+}
+
+.metric-value {
+    font-size: 2.5rem;
+    font-weight: bold;
+    margin-bottom: 5px;
+}
+
+.metric-label {
+    font-size: 0.9rem;
+    opacity: 0.9;
+}
+
+.status-indicator {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    display: inline-block;
+    margin-right: 8px;
+}
+
+.status-connected { background-color: #28a745; }
+.status-disconnected { background-color: #dc3545; }
+.status-mock { background-color: #ffc107; }
+
+.chart-container {
+    position: relative;
+    height: 300px;
+    margin-bottom: 20px;
+}
+
+#map {
+    height: 300px;
+    border-radius: 10px;
+    margin-bottom: 20px;
+}
+
+.table-container {
+    max-height: 400px;
+    overflow-y: auto;
+}
+
+.btn-control {
+    margin: 5px;
+    min-width: 120px;
+}
+
+.mock-toggle {
+    background-color: #6c757d;
+    border-color: #6c757d;
+}
+
+.mock-toggle.active {
+    background-color: #ffc107;
+    border-color: #ffc107;
+    color: #000;
+}
+
+#meterResult {
+    background: #f8f9fa;
+    border: 1px solid #e9ecef;
+    border-radius: .5rem;
+    padding: .75rem;
+  }
+  

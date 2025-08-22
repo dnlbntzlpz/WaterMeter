@@ -1,0 +1,4 @@
+#define WIFI_SSID "YOUR_WIFI_SSID"
+#define WIFI_PASS "YOUR_WIFI_PASSWORD"
+#define API_KEY   "YOUR_API_KEY"
+#define SERVER_URL "http://192.168.x.x:PORT"

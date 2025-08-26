@@ -192,15 +192,23 @@
                 <div class="card-header">
                 <h5>Water Meter OCR (GPT)</h5>
                 </div>
+        
                 <div class="card-body">
                 <input id="meterFile" class="form-control mb-2" type="file" accept="image/*">
-                <button id="meterAnalyzeBtn" class="btn btn-primary">Analyze</button>
+        
+                <div class="d-flex gap-2">
+                    <button id="meterAnalyzeBtn" class="btn btn-primary">Analyze</button>
+                    <!-- New: trigger the camera remotely -->
+                    <button id="captureNowBtn" class="btn btn-outline-secondary">Capture Now</button>
+                </div>
+                
+                <img id="latestImg" class="img-fluid rounded mt-3" alt="Latest snapshot" />
                 <pre id="meterResult" class="mt-3" style="white-space:pre-wrap;min-height:3em;"></pre>
                 </div>
             </div>
             </div>
         </div>
-        
+  
     </div>
 
     <!-- Bootstrap JS -->

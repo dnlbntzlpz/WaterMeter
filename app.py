@@ -73,6 +73,28 @@ def analyze_watermeter():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# --- capture coordination ---
+CAPTURE_SEQ = 0  # increments on each requested capture
+
+@app.post("/api/watermeter/capture")
+def request_capture():
+    """Called by dashboard to request a new capture."""
+    global CAPTURE_SEQ
+    CAPTURE_SEQ += 1
+    return {"ok": True, "seq": CAPTURE_SEQ}
+
+@app.get("/api/watermeter/capture/next")
+def capture_next():
+    """
+    Called by the device: ?since=<seq>
+    Returns {"capture": true, "seq": CAPTURE_SEQ} if a newer request exists.
+    """
+    try:
+        since = int(request.args.get("since", "0"))
+    except:
+        since = 0
+    return {"capture": (CAPTURE_SEQ > since), "seq": CAPTURE_SEQ}
+
 
 def _ext_from_name(name: str) -> str:
     name = name.lower()
@@ -95,4 +117,4 @@ def _coerce_json(s: str):
 
 if __name__ == "__main__":
     # dev server
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)

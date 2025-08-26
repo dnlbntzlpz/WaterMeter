@@ -21,8 +21,9 @@ let humChart = null;
 
 // Initialize dashboard
 document.addEventListener('DOMContentLoaded', function() {
+    console.log('[init] DOM ready');
     initializeCharts();
-    initializeMap();
+    //initializeMap();
     updateConnectionStatus();
   
     // (Optional) OCR button hook if you added that card:
@@ -41,6 +42,42 @@ document.addEventListener('DOMContentLoaded', function() {
           out.textContent = 'Error: ' + e.message;
         }
       });
+    }
+
+    // NEW: Capture Now
+    const captureBtn = document.getElementById('captureNowBtn');
+    console.log('[init] captureNowBtn found?', !!captureBtn);
+
+    if (captureBtn) {
+        captureBtn.addEventListener('click', async () => {
+            console.log('[click] Capture Now'); // <— should print on every click
+            captureBtn.disabled = true;
+            captureBtn.textContent = 'Capturing…';
+            try {
+                await requestRemoteCapture();           // tell server to ask device
+                const latest = await waitForNewImage(); // wait until device posts
+                
+                //refresh the snapshot image
+                const img = document.getElementById('latestImg');
+                if (img && latest?.imageUrl) {
+                    img.src = latest.imageUrl + '?t=' + Date.now(); // bust cache
+                }
+
+                // If you show the latest image/result elsewhere, refresh it here:
+                await refreshLatest?.();                // if you added that helper before
+                
+                // Also display OCR result if your /upload runs OCR:
+                const out = document.getElementById('meterResult');
+                if (out && latest?.result) {
+                out.textContent = JSON.stringify(latest.result, null, 2);
+                }
+            } catch (e) {
+                alert(e.message || 'Capture failed');
+            } finally {
+                captureBtn.disabled = false;
+                captureBtn.textContent = 'Capture Now';
+            }
+        });
     }
   });
   
@@ -465,6 +502,32 @@ async function analyzeMeter(file){
       throw new Error(msg);
     }
     return res.json();
+  }
+
+  async function requestRemoteCapture() {
+    const res = await fetch('/api/watermeter/capture', { method: 'POST' });
+    if (!res.ok) throw new Error(await res.text());
+    return res.json(); // {ok:true, seq:n}
+  }
+  
+  // Optionally wait until new image lands (simple retry loop)
+  async function waitForNewImage(timeoutMs = 10000, intervalMs = 800) {
+    const start = Date.now();
+    let lastSeen = null;
+    try {
+      const r0 = await fetch('/api/watermeter/latest');
+      const j0 = await r0.json();
+      lastSeen = j0?.result?.ts || 0;
+    } catch {}
+  
+    while (Date.now() - start < timeoutMs) {
+      await new Promise(r => setTimeout(r, intervalMs));
+      const r = await fetch('/api/watermeter/latest');
+      const j = await r.json();
+      const ts = j?.result?.ts || 0;
+      if (ts > lastSeen) return j;
+    }
+    throw new Error('Timed out waiting for device.');
   }
 
 // Expose functions for inline onclick handlers immediately

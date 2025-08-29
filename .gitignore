@@ -80,3 +80,5 @@ yarn-error.log*
 
 #Specific Files
 M5TimerCamSketch/secrets.h
+CamSketch/secrets.h
+uploads

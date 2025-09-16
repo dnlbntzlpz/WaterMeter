@@ -86,6 +86,19 @@ class Config:
     ).strip().lower() == "true"
 
 
+# Shared prompt for water meter OCR across endpoints
+METER_OCR_PROMPT = (
+    "You are a utility meter OCR assistant. The image shows a mechanical water meter. "
+    'Return ONLY strict JSON with keys: reading (string), confidence (0..1), notes (string). '
+    "reading must include leading zeros and the decimal if present. "
+    "Convert the readings from cubic meters to liters."
+    "The red parts of the meter are the decimal part."
+    "The reading should consist of 5 integer digits and 3 decimal digits."
+    "If uncertain about a wheel transition, choose the most probable and lower confidence. "
+    'Example: {"reading":"01234.567","confidence":0.86,"notes":"..."}'
+)
+
+
 # ---- Logging setup (do this before creating the app) ---------------------
 
 logging.basicConfig(
@@ -93,6 +106,9 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("watermeter.app")
+
+# Quiet noisy request logs from the development server
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 
 # ---- Flask app -----------------------------------------------------------
@@ -144,6 +160,9 @@ CAPTURE: Dict[str, Any] = {
 
 # Simple "legacy" sequence counter for the old polling flow
 CAPTURE_SEQ: int = 0  # increments on each requested capture
+
+# Relay activation sequence counter (legacy-style trigger the device polls)
+RELAY_SEQ: int = 0
 
 # Latest image tracking
 LATEST_META: Dict[str, Any] = {"ts": 0}
@@ -208,6 +227,60 @@ def _write_latest_atomically(img_bytes: bytes) -> int:
     return ts
 
 
+def _analyze_image_bytes(img_bytes: bytes, filename_hint: str = "latest.jpg") -> Dict[str, Any]:
+    """
+    Run the OpenAI Vision model on the provided image bytes and return a dict.
+    The dict will contain either {reading, confidence, notes} or {raw, warning}.
+    Raises on hard OpenAI errors so callers can decide how to handle.
+    """
+    if not app.config["OPENAI_API_KEY"]:
+        raise RuntimeError("OPENAI_API_KEY not set")
+
+    b64 = base64.b64encode(img_bytes).decode("utf-8")
+    ext = _ext_from_name(filename_hint)
+    image_url = f"data:image/{ext};base64,{b64}"
+
+    client = _get_openai_client()
+    resp = client.chat.completions.create(
+        model=app.config["OPENAI_MODEL"],
+        temperature=0,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": METER_OCR_PROMPT},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            }
+        ],
+    )
+    text = (resp.choices[0].message.content or "").strip()
+    data = _coerce_json(text)
+    if "reading" not in data:
+        data = {"raw": text, "warning": "Model did not return strict JSON; see 'raw'."}
+    return data
+
+
+def _store_latest_ocr_result(result: Dict[str, Any]) -> None:
+    """Merge OCR result into LATEST_META under the same lock used elsewhere."""
+    with CAP_LOCK:
+        if isinstance(result, dict):
+            # Only allow a small, known subset through to avoid bloat
+            reading = result.get("reading")
+            confidence = result.get("confidence")
+            notes = result.get("notes") or result.get("warning")
+            raw = result.get("raw")
+            if reading is not None:
+                LATEST_META["reading"] = reading
+            if confidence is not None:
+                LATEST_META["confidence"] = confidence
+            if notes is not None:
+                LATEST_META["notes"] = notes
+            if raw is not None and "raw" not in LATEST_META:
+                # keep raw only if we don't already have one
+                LATEST_META["raw"] = raw
+
+
 # =========================================================================
 # ### Healthcheck & Static
 # =========================================================================
@@ -246,6 +319,21 @@ def root():
     # If we get here, neither location had index.html
     logger.warning("index.html not found in expected locations.")
     return jsonify(error="index.html not found"), 404
+
+
+@app.get("/uploads/<path:filename>")
+def serve_upload(filename: str):
+    """Serve files from the uploads directory with no-store headers."""
+    fp = (UPLOAD_DIR / filename).resolve()
+    try:
+        # ensure path stays within uploads dir
+        fp.relative_to(UPLOAD_DIR.resolve())
+    except Exception:
+        return jsonify(error="invalid path"), 400
+    if not fp.exists():
+        return jsonify(error="not found"), 404
+    resp = make_response(send_file(fp.as_posix()))
+    return nocache_resp(resp)
 
 
 # =========================================================================
@@ -292,37 +380,12 @@ def analyze_watermeter():
     ext = _ext_from_name(filename)
     image_url = f"data:image/{ext};base64,{b64}"
 
-    instruction = (
-        "You are a utility meter OCR assistant. The image shows a mechanical water meter. "
-        'Return ONLY strict JSON with keys: reading (string), confidence (0..1), notes (string). '
-        "reading must include leading zeros and the decimal if present. "
-        "If uncertain about a wheel transition, choose the most probable and lower confidence. "
-        'Example: {"reading":"01234.567","confidence":0.86,"notes":"..."}'
-    )
+    instruction = METER_OCR_PROMPT
 
     try:
-        client = _get_openai_client()
-        resp = client.chat.completions.create(
-            model=app.config["OPENAI_MODEL"],
-            temperature=0,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": instruction},
-                        {"type": "image_url", "image_url": {"url": image_url}},
-                    ],
-                }
-            ],
-        )
-        text = (resp.choices[0].message.content or "").strip()
-        data = _coerce_json(text)
-        if "reading" not in data:
-            # Preserve model text but give callers a structured warning.
-            data = {
-                "raw": text,
-                "warning": "Model did not return strict JSON; see 'raw'.",
-            }
+        client = _get_openai_client()  # ensure client initialized for helpful 500
+        # Reuse the same implementation as auto-OCR helper
+        data = _analyze_image_bytes(img_bytes, filename)
         return jsonify(data), 200
     except Exception as e:
         logger.exception("Error during meter analysis: %s", e)
@@ -365,6 +428,57 @@ def capture_request():
         )
     logger.info("Capture requested: seq=%s token=%s", CAPTURE_SEQ, token)
     return jsonify({"ok": True, "seq": CAPTURE_SEQ, "token": token})
+
+
+# =========================================================================
+# ### API: Relay Control (sequence-based trigger)
+# =========================================================================
+
+
+@app.post("/api/device/relay/activate")
+def relay_activate():
+    """
+    Request the ESP32 to activate a relay for a fixed duration (device-side).
+
+    Behavior
+    --------
+    - Increments a monotonic sequence number that the device polls.
+
+    Response
+    --------
+    200 JSON: {"ok": true, "seq": <int>}
+    """
+    global RELAY_SEQ
+    with CAP_LOCK:
+        RELAY_SEQ += 1
+        seq = RELAY_SEQ
+    logger.info("Relay activation requested: seq=%s", seq)
+    return jsonify({"ok": True, "seq": seq})
+
+
+@app.get("/api/device/relay/next")
+def relay_next():
+    """
+    Device long-poll (relay flow):
+    Ask if a relay activation has been requested since a given sequence number.
+
+    Query Params
+    ------------
+    since : int (default 0)
+
+    Response
+    --------
+    200 JSON: {"activate": <bool>, "seq": <int>}
+    """
+    try:
+        since = int(request.args.get("since", "0"))
+    except Exception:
+        since = 0
+    with CAP_LOCK:
+        activate_needed = RELAY_SEQ > since
+        seq = RELAY_SEQ
+    logger.debug("Relay poll since=%s -> activate=%s seq=%s", since, activate_needed, seq)
+    return jsonify(activate=activate_needed, seq=seq)
 
 
 @app.get("/api/watermeter/capture/next")
@@ -477,6 +591,16 @@ def upload_image():
         CAPTURE["state"] = "PUBLISHED"
         CAPTURE["ts_published"] = ts
 
+    # After publishing, try OCR in background-like manner (still in-request for simplicity)
+    try:
+        with open(LATEST_PATH, "rb") as fp:
+            img_b = fp.read()
+        result = _analyze_image_bytes(img_b, f"{tok}.jpg")
+        _store_latest_ocr_result(result)
+        logger.info("OCR stored for token=%s reading=%s conf=%s", tok, result.get("reading"), result.get("confidence"))
+    except Exception as e:
+        logger.warning("OCR failed post-upload: %s", e)
+
     logger.info("Image uploaded and published: token=%s ts=%s", tok, LATEST_META["ts"])
     return jsonify({"ok": True, "ts": LATEST_META["ts"], "image_url": CAPTURE["image_url"]})
 
@@ -531,6 +655,22 @@ def upload_legacy():
 
     ts = _write_latest_atomically(img_bytes)
     logger.info("Legacy upload -> latest.jpg updated ts=%s", ts)
+
+    # Bridge legacy flow -> mark current token as published if a request is active
+    with CAP_LOCK:
+        if CAPTURE.get("token") and CAPTURE.get("state") in ("REQUESTED", "ACKED", "UPLOADED"):
+            CAPTURE["state"] = "PUBLISHED"
+            CAPTURE["ts_published"] = ts
+            CAPTURE["image_url"] = "/latest.jpg"
+
+    # Kick OCR for legacy uploads as well
+    try:
+        result = _analyze_image_bytes(img_bytes, "latest.jpg")
+        _store_latest_ocr_result(result)
+        logger.info("OCR stored (legacy) reading=%s conf=%s", result.get("reading"), result.get("confidence"))
+    except Exception as e:
+        logger.warning("OCR failed (legacy upload): %s", e)
+
     return jsonify(ok=True, ts=ts)
 
 
@@ -550,7 +690,11 @@ def latest_meta():
     """
     exists = LATEST_PATH.exists()
     resp = make_response(
-        jsonify(hasImage=exists, imageUrl="/latest.jpg" if exists else None, result=LATEST_META)
+        jsonify(
+            hasImage=exists,
+            imageUrl="/latest.jpg" if exists else None,
+            result=LATEST_META,
+        )
     )
     return nocache_resp(resp)
 

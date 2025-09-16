@@ -18,6 +18,8 @@ let map = null;
 // Charts
 let tempChart = null;
 let humChart = null;
+let readingChart = null;
+let readingData = [];
 
 // Initialize dashboard
 document.addEventListener("DOMContentLoaded", async function () {
@@ -26,23 +28,25 @@ document.addEventListener("DOMContentLoaded", async function () {
   // initializeMap();
   updateConnectionStatus();
 
-  // OCR button hook
+  // OCR button hook (manual analyze optional)
   const analyzeBtn = document.getElementById("meterAnalyzeBtn");
   if (analyzeBtn) {
     analyzeBtn.addEventListener("click", async () => {
       const fileInput = document.getElementById("meterFile");
       const out = document.getElementById("meterResult");
       const f = fileInput?.files?.[0];
-      if (!f) {
-        alert("Choose an image first.");
-        return;
-      }
+      if (!f) { alert("Choose an image first."); return; }
       out.textContent = "Analyzing…";
       try {
         const data = await analyzeMeter(f);
         out.textContent = JSON.stringify(data, null, 2);
+        const wmEl = document.getElementById("wmValue");
+        if (wmEl && typeof data?.reading !== "undefined") {
+          wmEl.textContent = String(data.reading);
+          appendReadingPoint(data.reading);
+        }
       } catch (e) {
-        out.textContent = "Error: " + e.message;
+        out.textContent = "Error: " + (e?.message || String(e));
       }
     });
   }
@@ -61,6 +65,10 @@ document.addEventListener("DOMContentLoaded", async function () {
     console.warn("[init] latest fetch failed:", e);
     latestTs = 0;
   }
+
+  // Start polling for latest metadata (includes OCR results)
+  try { await refreshLatest(); } catch (e) {}
+  setInterval(() => { if (!isCapturing) refreshLatest().catch(() => {}); }, 3000);
 
   // ROBUST: Capture Now
   const captureBtn = document.getElementById("captureNowBtn");
@@ -111,6 +119,32 @@ document.addEventListener("DOMContentLoaded", async function () {
             statusEl.textContent = prevStatus;
           }, 3000);
         }
+      }
+    });
+  }
+
+  // Relay activation
+  const relayBtn = document.getElementById("relayBtn");
+  if (relayBtn) {
+    relayBtn.addEventListener("click", async () => {
+      const statusEl = document.getElementById("meterResult");
+      const prev = statusEl?.textContent ?? "";
+      const restoreText = relayBtn.textContent;
+      try {
+        relayBtn.disabled = true;
+        relayBtn.textContent = "Activating…";
+        if (statusEl) statusEl.textContent = "⚡ Requesting relay activation…";
+        const r = await fetch("/api/device/relay/activate", { method: "POST" });
+        if (!r.ok) throw new Error(`relay request ${r.status}`);
+        const j = await r.json().catch(() => ({}));
+        if (statusEl) statusEl.textContent = `✅ Relay activation requested (seq: ${j.seq ?? "?"})`;
+        // Optional: auto-restore status message
+        if (statusEl) setTimeout(() => { statusEl.textContent = prev; }, 3000);
+      } catch (e) {
+        if (statusEl) statusEl.textContent = `❌ ${e.message || "Relay activation failed"}`;
+      } finally {
+        relayBtn.disabled = false;
+        relayBtn.textContent = restoreText;
       }
     });
   }
@@ -294,12 +328,17 @@ function generateMockData() {
 
 // Data processing
 function processSensorData(data) {
-  // Update metrics
-  document.getElementById("tempValue").textContent = data.temp_c.toFixed(1);
-  document.getElementById("humValue").textContent = data.hum_pct.toFixed(1);
-  document.getElementById("latValue").textContent = data.gps_lat.toFixed(4);
-  document.getElementById("lonValue").textContent = data.gps_lon.toFixed(4);
-  document.getElementById("satValue").textContent = data.gps_sat;
+  // Update metrics if elements exist (most cards hidden)
+  const elTemp = document.getElementById("tempValue");
+  if (elTemp) elTemp.textContent = data.temp_c.toFixed(1);
+  const elHum = document.getElementById("humValue");
+  if (elHum) elHum.textContent = data.hum_pct.toFixed(1);
+  const elLat = document.getElementById("latValue");
+  if (elLat) elLat.textContent = data.gps_lat.toFixed(4);
+  const elLon = document.getElementById("lonValue");
+  if (elLon) elLon.textContent = data.gps_lon.toFixed(4);
+  const elSat = document.getElementById("satValue");
+  if (elSat) elSat.textContent = data.gps_sat;
 
   // Update reading rate
   const now = Date.now();
@@ -355,42 +394,97 @@ function initializeCharts() {
   };
 
   // Temperature chart
-  const tempCtx = document.getElementById("tempChart").getContext("2d");
-  tempChart = new Chart(tempCtx, {
-    type: "line",
-    data: {
-      labels: [],
-      datasets: [
-        {
-          label: "Temperature",
-          data: [],
-          borderColor: "rgb(255, 99, 132)",
-          backgroundColor: "rgba(255, 99, 132, 0.1)",
-          tension: 0.4,
-        },
-      ],
-    },
-    options: chartOptions,
-  });
+  const tempCanvas = document.getElementById("tempChart");
+  if (tempCanvas) {
+    const tempCtx = tempCanvas.getContext("2d");
+    tempChart = new Chart(tempCtx, {
+      type: "line",
+      data: {
+        labels: [],
+        datasets: [
+          {
+            label: "Temperature",
+            data: [],
+            borderColor: "rgb(255, 99, 132)",
+            backgroundColor: "rgba(255, 99, 132, 0.1)",
+            tension: 0.4,
+          },
+        ],
+      },
+      options: chartOptions,
+    });
+  }
 
   // Humidity chart
-  const humCtx = document.getElementById("humChart").getContext("2d");
-  humChart = new Chart(humCtx, {
-    type: "line",
-    data: {
-      labels: [],
-      datasets: [
-        {
-          label: "Humidity",
-          data: [],
-          borderColor: "rgb(54, 162, 235)",
-          backgroundColor: "rgba(54, 162, 235, 0.1)",
-          tension: 0.4,
+  const humCanvas = document.getElementById("humChart");
+  if (humCanvas) {
+    const humCtx = humCanvas.getContext("2d");
+    humChart = new Chart(humCtx, {
+      type: "line",
+      data: {
+        labels: [],
+        datasets: [
+          {
+            label: "Humidity",
+            data: [],
+            borderColor: "rgb(54, 162, 235)",
+            backgroundColor: "rgba(54, 162, 235, 0.1)",
+            tension: 0.4,
+          },
+        ],
+      },
+      options: chartOptions,
+    });
+  }
+
+  // Reading trend chart
+  const readingCanvas = document.getElementById("readingChart");
+  if (readingCanvas) {
+    const ctx = readingCanvas.getContext("2d");
+    readingChart = new Chart(ctx, {
+      type: "line",
+      data: {
+        labels: [],
+        datasets: [
+          {
+            label: "Meter Reading",
+            data: [],
+            borderColor: "#20c997",
+            backgroundColor: "rgba(32, 201, 151, 0.1)",
+            tension: 0.3,
+            pointRadius: 0,
+          },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        scales: {
+          x: { display: true, title: { display: true, text: "Time" } },
+          y: { display: true, title: { display: true, text: "Reading" } },
         },
-      ],
-    },
-    options: chartOptions,
-  });
+        plugins: { legend: { display: false } },
+      },
+    });
+  }
+}
+
+function appendReadingPoint(reading, ts) {
+  const canvasPresent = !!document.getElementById("readingChart");
+  if (!canvasPresent) return;
+  const value = parseFloat(reading);
+  if (!isFinite(value)) return;
+  const when = ts ? new Date(ts) : new Date();
+  const label = when.toLocaleTimeString();
+
+  readingData.push({ x: label, y: value });
+  if (readingData.length > 60) readingData.shift();
+
+  if (readingChart) {
+    readingChart.data.labels = readingData.map(d => d.x);
+    readingChart.data.datasets[0].data = readingData.map(d => d.y);
+    readingChart.update("none");
+  }
 }
 
 function updateCharts(data) {
@@ -582,6 +676,28 @@ function setLatestImage(ts, imageUrl) {
   tmp.src = url;
 }
 
+async function analyzeLatest() {
+  // Cache-bust using the ts your API already exposes
+  const metaRes = await fetch('/api/watermeter/latest');
+  const meta = await metaRes.json();
+  if (!meta.hasImage) {
+    return { error: 'No image yet' };
+  }
+
+  const imgRes = await fetch(`/latest.jpg?ts=${meta.result.ts}`);
+  const blob = await imgRes.blob();
+  const file = new File([blob], 'latest.jpg', { type: blob.type || 'image/jpeg' });
+
+  const form = new FormData();
+  form.append('image', file);
+
+  const res = await fetch('/api/watermeter/analyze', { method: 'POST', body: form });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`Analyze failed: ${res.status} ${txt}`);
+  }
+  return res.json(); // { reading, confidence, notes } OR { raw, warning }
+}
 
 // Optionally wait until new image lands (simple retry loop)
 async function waitForNewImage(
@@ -618,29 +734,10 @@ async function captureNow() {
     const { ok, token } = await r.json();
     if (!ok || !token) throw new Error("no token");
 
-    if (statusEl) statusEl.textContent = "🛰️ Waiting for ESP ACK…";
-    await pollCaptureState(token, { untilState: "ACKED", timeoutMs: 15000 });
-
-    if (statusEl) statusEl.textContent = "⬆️ Waiting for upload…";
-    const pub = await pollCaptureState(token, { untilState: "PUBLISHED", timeoutMs: 25000 });
-
-    // (4) PINTA SOLO EL TOKEN.JPG (no latest)
-    if (pub.image_url && pub.ts_published) {
-      setLatestImage(pub.ts_published, pub.image_url); // /uploads/<token>.jpg
-      if (statusEl) statusEl.textContent = `✅ New image (ts: ${pub.ts_published})`;
-    } else {
-      throw new Error("published without image_url");
-    }
-
-    // (5) (Opcional) tras 300ms sincroniza con /latest.jpg para “idle”
-    setTimeout(async () => {
-      try {
-        const meta = await getLatestMeta(); // {hasImage,imageUrl:'/latest.jpg', result:{ts}}
-        if (meta?.hasImage && meta?.imageUrl && (meta.result?.ts ?? 0) >= latestTs) {
-          setLatestImage(meta.result.ts, meta.imageUrl);
-        }
-      } catch {}
-    }, 300);
+    // Switch to simple wait-on-latest (compatible with legacy uploader)
+    if (statusEl) statusEl.textContent = "⬆️ Waiting for latest.jpg…";
+    await waitForNewImage(prevTs, { timeoutMs: 25000, intervalMs: 400 });
+    await refreshLatest();
 
   } catch (e) {
     if (statusEl) statusEl.textContent = `❌ ${e.message || "Capture failed"}`;
@@ -660,6 +757,13 @@ async function refreshLatest() {
     if (j?.hasImage && j?.imageUrl) {
       const ts = j.result?.ts ?? 0;
       if (ts > latestTs) setLatestImage(ts, j.imageUrl);
+    }
+    // Update OCR metric from server-provided metadata when available
+    const reading = j?.result?.reading;
+    const wmEl = document.getElementById("wmValue");
+    if (wmEl && typeof reading !== "undefined") {
+      wmEl.textContent = String(reading);
+      appendReadingPoint(reading, j?.result?.ts);
     }
     const out = document.getElementById("meterResult");
     if (out && j?.result) out.textContent = JSON.stringify(j.result, null, 2);

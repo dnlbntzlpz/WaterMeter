@@ -112,6 +112,26 @@ static bool parseCaptureJson(const String& body, bool& capture, int& seq) {
   return true;
 }
 
+static bool parseRelayJson(const String& body, bool& activate, int& seq) {
+  int sIdx = body.indexOf("\"seq\"");
+  int aIdx = body.indexOf("\"activate\"");
+  if (sIdx < 0 || aIdx < 0) return false;
+
+  int sc = body.indexOf(':', sIdx);
+  if (sc < 0) return false;
+  int sEnd = body.indexOf(',', sc);
+  String seqStr = body.substring(sc + 1, (sEnd > 0 ? sEnd : body.length()));
+  seqStr.trim();
+  seq = seqStr.toInt();
+
+  int ac = body.indexOf(':', aIdx);
+  if (ac < 0) return false;
+  String actStr = body.substring(ac + 1);
+  actStr.trim();
+  activate = actStr.startsWith("true");
+  return true;
+}
+
 static bool postJpegRaw(const uint8_t* data, size_t len) {
   WiFiClient client;
   HTTPClient http;
@@ -158,6 +178,8 @@ static camera_fb_t* snapFreshJpeg(uint16_t warmup_delay_ms = 40) {
 }
 
 // ---------- Setup / Loop ----------
+// Relay control pin
+#define RELAY_PIN 10
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -169,11 +191,17 @@ void setup() {
 
   configureCamera();
   Serial.println("Camera ready");
+
+  // Relay pin setup
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, LOW);
 }
 
 void loop() {
   static int lastSeq = 0;
   static unsigned long lastPollMs = 0;
+  static int lastRelaySeq = 0;
+  static unsigned long lastRelayPollMs = 0;
 
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi dropped, reconnecting...");
@@ -219,6 +247,34 @@ void loop() {
       } else {
         Serial.println("upload failed");
       }
+    }
+  }
+
+  // Poll relay trigger every ~1s
+  if (millis() - lastRelayPollMs > 1000) {
+    lastRelayPollMs = millis();
+
+    String body;
+    String path = String("/api/device/relay/next?since=") + lastRelaySeq;
+    if (!httpGet(path, body)) {
+      // Serial.println("relay poll failed");
+      return;
+    }
+
+    bool doActivate = false;
+    int rseq = lastRelaySeq;
+    if (!parseRelayJson(body, doActivate, rseq)) {
+      // Serial.println("relay bad json");
+      return;
+    }
+
+    if (doActivate) {
+      Serial.printf("Relay activation requested (seq=%d)\n", rseq);
+      digitalWrite(RELAY_PIN, HIGH);
+      delay(5000);
+      digitalWrite(RELAY_PIN, LOW);
+      lastRelaySeq = rseq;  // acknowledge after action
+      Serial.println("relay done");
     }
   }
 }

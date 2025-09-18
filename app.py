@@ -36,6 +36,8 @@ import secrets
 from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, Optional, Tuple
+import threading
+import random
 
 from flask import (
     Flask,
@@ -50,8 +52,8 @@ from werkzeug.utils import secure_filename
 # ---- Optional: load .env early so env vars are available for Config ----
 try:
     from dotenv import load_dotenv
-
-    load_dotenv()
+    # Load .env from the directory of this file, regardless of current working dir
+    load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 except Exception:
     # .env is optional; ignore if not installed or missing.
     pass
@@ -85,13 +87,21 @@ class Config:
         "JSONIFY_PRETTYPRINT_REGULAR", "false"
     ).strip().lower() == "true"
 
+    # Capture behavior
+    CAPTURE_TTL_MS: int = int(os.getenv("CAPTURE_TTL_MS", "20000"))  # drop stale requests
+
+    # Auto-cycle relay (server-initiated) configuration
+    AUTOCYCLE_ENABLED: bool = os.getenv("AUTOCYCLE_ENABLED", "true").strip().lower() == "true"
+    AUTOCYCLE_MIN_MIN: int = int(os.getenv("AUTOCYCLE_MIN_MIN", "20"))
+    AUTOCYCLE_MAX_MIN: int = int(os.getenv("AUTOCYCLE_MAX_MIN", "60"))
+
 
 # Shared prompt for water meter OCR across endpoints
 METER_OCR_PROMPT = (
     "You are a utility meter OCR assistant. The image shows a mechanical water meter. "
     'Return ONLY strict JSON with keys: reading (string), confidence (0..1), notes (string). '
     "reading must include leading zeros and the decimal if present. "
-    "Convert the readings from cubic meters to liters."
+    #"Convert the readings from cubic meters to liters."
     "The red parts of the meter are the decimal part."
     "The reading should consist of 5 integer digits and 3 decimal digits."
     "If uncertain about a wheel transition, choose the most probable and lower confidence. "
@@ -210,6 +220,43 @@ def _coerce_json(s: str) -> Dict[str, Any]:
 def _new_token() -> str:
     """Generate a short token (hex) used to correlate image uploads."""
     return secrets.token_hex(8)
+
+
+def _bump_relay_seq_locked() -> int:
+    """Increment RELAY_SEQ under CAP_LOCK and return new seq."""
+    global RELAY_SEQ
+    RELAY_SEQ += 1
+    return RELAY_SEQ
+
+
+def _autocycle_worker():
+    """Background worker that periodically requests relay activation.
+
+    Picks a random interval in [AUTOCYCLE_MIN_MIN, AUTOCYCLE_MAX_MIN] minutes,
+    then signals the device via RELAY_SEQ increment.
+    """
+    min_m = max(1, int(app.config["AUTOCYCLE_MIN_MIN"]))
+    max_m = max(min_m, int(app.config["AUTOCYCLE_MAX_MIN"]))
+    logger.info("Auto-cycle: enabled (min=%sm, max=%sm)", min_m, max_m)
+
+    while True:
+        try:
+            wait_min = random.randint(min_m, max_m)
+            wait_sec = wait_min * 60
+            logger.info("Auto-cycle: next relay activation in %s minutes", wait_min)
+            # Sleep in chunks to avoid very long sleeps
+            remaining = wait_sec
+            while remaining > 0:
+                chunk = min(30, remaining)
+                time.sleep(chunk)
+                remaining -= chunk
+
+            with CAP_LOCK:
+                seq = _bump_relay_seq_locked()
+            logger.info("Auto-cycle: relay activation requested (seq=%s)", seq)
+        except Exception as e:
+            logger.warning("Auto-cycle worker error: %s", e)
+            time.sleep(5)
 
 
 def _write_latest_atomically(img_bytes: bytes) -> int:
@@ -412,20 +459,29 @@ def capture_request():
     200 JSON: {"ok": true, "seq": <int>, "token": "<hex>"}
     """
     global CAPTURE_SEQ
+    now_ms = int(time.time() * 1000)
     with CAP_LOCK:
-        CAPTURE_SEQ += 1  # legacy clients poll /capture/next?since=<seq>
-        token = _new_token()
-        CAPTURE.update(
-            {
-                "token": token,
-                "state": "REQUESTED",
-                "ts_requested": int(time.time() * 1000),
-                "ts_acked": None,
-                "ts_uploaded": None,
-                "ts_published": None,
-                "image_url": None,
-            }
-        )
+        # Coalesce if a fresh request is already pending
+        if CAPTURE.get("state") in ("REQUESTED", "ACKED") and (
+            now_ms - (CAPTURE.get("ts_requested") or 0)
+        ) <= app.config["CAPTURE_TTL_MS"]:
+            token = CAPTURE.get("token") or _new_token()
+            # Still bump seq for legacy UI feedback but keep same token/state/time
+            CAPTURE_SEQ += 1
+        else:
+            CAPTURE_SEQ += 1  # legacy clients poll /capture/next?since=<seq>
+            token = _new_token()
+            CAPTURE.update(
+                {
+                    "token": token,
+                    "state": "REQUESTED",
+                    "ts_requested": now_ms,
+                    "ts_acked": None,
+                    "ts_uploaded": None,
+                    "ts_published": None,
+                    "image_url": None,
+                }
+            )
     logger.info("Capture requested: seq=%s token=%s", CAPTURE_SEQ, token)
     return jsonify({"ok": True, "seq": CAPTURE_SEQ, "token": token})
 
@@ -499,8 +555,13 @@ def capture_next():
         since = int(request.args.get("since", "0"))
     except Exception:
         since = 0
+    now_ms = int(time.time() * 1000)
     with CAP_LOCK:
-        capture_needed = CAPTURE_SEQ > since
+        # Only signal capture if there is a newer request AND it is still fresh
+        capture_needed = CAPTURE_SEQ > since and (
+            CAPTURE.get("state") in ("REQUESTED", "ACKED") and
+            (now_ms - (CAPTURE.get("ts_requested") or 0)) <= app.config["CAPTURE_TTL_MS"]
+        )
         seq = CAPTURE_SEQ
     logger.debug("Device poll since=%s -> capture=%s seq=%s", since, capture_needed, seq)
     return jsonify(capture=capture_needed, seq=seq)
@@ -750,6 +811,10 @@ if __name__ == "__main__":
     logger.info(
         "Starting dev server on %s:%s (debug=%s)", app.config["HOST"], app.config["PORT"], app.config["DEBUG"]
     )
+    # Start auto-cycle worker if enabled
+    if app.config.get("AUTOCYCLE_ENABLED", False):
+        t = threading.Thread(target=_autocycle_worker, name="autocycle", daemon=True)
+        t.start()
     app.run(
         host=app.config["HOST"],
         port=app.config["PORT"],

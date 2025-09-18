@@ -41,18 +41,29 @@ static void configureCamera() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
 
-  config.frame_size   = FRAMESIZE_VGA;
+  // Choose conservative defaults; adapt if PSRAM missing
+  bool has_psram = psramFound();
+  Serial.printf("PSRAM detected: %s\n", has_psram ? "yes" : "no");
+  config.frame_size   = has_psram ? FRAMESIZE_VGA  : FRAMESIZE_QVGA;
   config.jpeg_quality = 12;
-
-  // Key bits:
-  config.fb_count     = 2;                    // allow driver to rotate buffers
-  config.fb_location  = CAMERA_FB_IN_PSRAM;   // typical for S3 boards
-  config.grab_mode    = CAMERA_GRAB_LATEST;   // prefer freshest frame
+  config.fb_count     = has_psram ? 2 : 1;
+  config.fb_location  = has_psram ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
+  config.grab_mode    = (config.fb_count > 1) ? CAMERA_GRAB_LATEST : CAMERA_GRAB_WHEN_EMPTY;
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    Serial.printf("Camera init failed 0x%x\n", err);
-    while (true) delay(1000);
+    Serial.printf("Camera init failed 0x%x, retrying with safer settings...\n", err);
+    // Retry with minimal memory usage
+    config.frame_size   = FRAMESIZE_QVGA;
+    config.jpeg_quality = 15;
+    config.fb_count     = 1;
+    config.fb_location  = CAMERA_FB_IN_DRAM;
+    config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+    err = esp_camera_init(&config);
+    if (err != ESP_OK) {
+      Serial.printf("Camera init failed again 0x%x\n", err);
+      while (true) delay(1000);
+    }
   }
 }
 
@@ -178,8 +189,10 @@ static camera_fb_t* snapFreshJpeg(uint16_t warmup_delay_ms = 40) {
 }
 
 // ---------- Setup / Loop ----------
-// Relay control pin
-#define RELAY_PIN 10
+// Relay control pin (avoid camera pins; on XIAO ESP32S3, GPIO10 is XCLK)
+#ifndef RELAY_PIN
+#define RELAY_PIN D3
+#endif
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -202,6 +215,7 @@ void loop() {
   static unsigned long lastPollMs = 0;
   static int lastRelaySeq = 0;
   static unsigned long lastRelayPollMs = 0;
+  static int randRelayTime = 0;
 
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi dropped, reconnecting...");
@@ -270,11 +284,25 @@ void loop() {
 
     if (doActivate) {
       Serial.printf("Relay activation requested (seq=%d)\n", rseq);
+      randRelayTime = random(20000, 60000);
+      Serial.printf("Activiting Relay for %d ms\n", randRelayTime);
       digitalWrite(RELAY_PIN, HIGH);
-      delay(5000);
+      //delay(10000); //ten seconds
+      delay(randRelayTime);
       digitalWrite(RELAY_PIN, LOW);
       lastRelaySeq = rseq;  // acknowledge after action
       Serial.println("relay done");
+
+      // Immediately trigger a capture after relay cycle completes
+      // This uses the existing capture flow by querying for a new request once
+      // and, if none, we fall back to pushing a legacy upload directly.
+      // Simple approach: request a fresh frame and upload it.
+      camera_fb_t* fb = snapFreshJpeg(60);
+      if (fb) {
+        bool ok = postJpegRaw(fb->buf, fb->len);
+        esp_camera_fb_return(fb);
+        Serial.println(ok ? "post-capture upload ok" : "post-capture upload failed");
+      }
     }
   }
 }

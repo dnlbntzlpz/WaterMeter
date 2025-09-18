@@ -207,22 +207,12 @@
             </div>
 
             <div class="card-body">
-              <input
-                id="meterFile"
-                class="form-control mb-2"
-                type="file"
-                accept="image/*"
-              />
-
               <div class="d-flex gap-2">
-                <button id="meterAnalyzeBtn" class="btn btn-primary">
-                  Analyze
-                </button>
-                <!-- New: trigger the camera remotely -->
+                <!-- Trigger the camera remotely -->
                 <button id="captureNowBtn" class="btn btn-outline-secondary">
                   Capture Now
                 </button>
-                <!-- New: activate the relay on the device -->
+                <!-- Activate the relay on the device -->
                 <button id="relayBtn" class="btn btn-outline-danger">
                   Activate Relay
                 </button>
@@ -250,6 +240,23 @@
             <div class="card-body">
               <div class="chart-container">
                 <canvas id="readingChart"></canvas>
+              </div>
+              <div class="mt-3">
+                <div class="d-flex align-items-center justify-content-between">
+                  <h6 class="mb-1">Reading History</h6>
+                  <small class="text-muted">last 30</small>
+                </div>
+                <div class="table-responsive">
+                  <table class="table table-sm mb-0">
+                    <thead>
+                      <tr>
+                        <th style="width:55%">Time</th>
+                        <th class="text-end">Reading</th>
+                      </tr>
+                    </thead>
+                    <tbody id="readingHistory"></tbody>
+                  </table>
+                </div>
               </div>
             </div>
           </div>

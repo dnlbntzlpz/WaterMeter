@@ -20,6 +20,8 @@ let tempChart = null;
 let humChart = null;
 let readingChart = null;
 let readingData = [];
+let lastReadingTs = 0;
+let readingHistory = [];
 
 // Initialize dashboard
 document.addEventListener("DOMContentLoaded", async function () {
@@ -58,12 +60,15 @@ document.addEventListener("DOMContentLoaded", async function () {
       // fija latestTs antes de pintar
       latestTs = meta0.result?.ts ?? 0;
       setLatestImage(latestTs, meta0.imageUrl);
+      lastReadingTs = latestTs;
     } else {
       latestTs = 0;
+      lastReadingTs = 0;
     }
   } catch (e) {
     console.warn("[init] latest fetch failed:", e);
     latestTs = 0;
+    lastReadingTs = 0;
   }
 
   // Start polling for latest metadata (includes OCR results)
@@ -367,6 +372,11 @@ function processSensorData(data) {
 
 // Chart functions
 function initializeCharts() {
+  // If Chart.js failed to load (offline/CDN blocked), skip charts so the rest of the UI still works
+  if (typeof Chart === "undefined") {
+    console.warn("[charts] Chart.js not available; disabling charts");
+    return;
+  }
   const chartOptions = {
     responsive: true,
     maintainAspectRatio: false,
@@ -475,16 +485,32 @@ function appendReadingPoint(reading, ts) {
   const value = parseFloat(reading);
   if (!isFinite(value)) return;
   const when = ts ? new Date(ts) : new Date();
-  const label = when.toLocaleTimeString();
+  const label = when.toLocaleTimeString(); // chart label (time only)
+  const labelDateTime = when.toLocaleString(); // history label (date + time)
 
   readingData.push({ x: label, y: value });
   if (readingData.length > 60) readingData.shift();
+
+  // History table (keep last 30)
+  readingHistory.push({ ts, label: labelDateTime, value });
+  if (readingHistory.length > 30) readingHistory.shift();
+  renderReadingHistory();
 
   if (readingChart) {
     readingChart.data.labels = readingData.map(d => d.x);
     readingChart.data.datasets[0].data = readingData.map(d => d.y);
     readingChart.update("none");
   }
+}
+
+function renderReadingHistory() {
+  const tbody = document.getElementById("readingHistory");
+  if (!tbody) return;
+  // Render newest first
+  const rows = [...readingHistory].slice(-30).reverse().map(r =>
+    `<tr><td>${r.label}</td><td class="text-end">${r.value}</td></tr>`
+  ).join("");
+  tbody.innerHTML = rows || "";
 }
 
 function updateCharts(data) {
@@ -593,6 +619,11 @@ function updateConnectionStatus() {
   const connectBtn = document.getElementById("connectBtn");
   const disconnectBtn = document.getElementById("disconnectBtn");
   const mockBtn = document.getElementById("mockBtn");
+
+  // Controls panel may be commented out in HTML; bail safely if missing
+  if (!statusIndicator || !statusText || !connectBtn || !disconnectBtn || !mockBtn) {
+    return;
+  }
 
   if (isConnected) {
     statusIndicator.className = "status-indicator status-connected";
@@ -736,7 +767,7 @@ async function captureNow() {
 
     // Switch to simple wait-on-latest (compatible with legacy uploader)
     if (statusEl) statusEl.textContent = "⬆️ Waiting for latest.jpg…";
-    await waitForNewImage(prevTs, { timeoutMs: 25000, intervalMs: 400 });
+    await waitForNewImage(latestTs, { timeoutMs: 25000, intervalMs: 400 });
     await refreshLatest();
 
   } catch (e) {
@@ -760,10 +791,14 @@ async function refreshLatest() {
     }
     // Update OCR metric from server-provided metadata when available
     const reading = j?.result?.reading;
+    const ts2 = j?.result?.ts ?? 0;
     const wmEl = document.getElementById("wmValue");
-    if (wmEl && typeof reading !== "undefined") {
-      wmEl.textContent = String(reading);
-      appendReadingPoint(reading, j?.result?.ts);
+    if (typeof reading !== "undefined") {
+      if (wmEl) wmEl.textContent = String(reading);
+      if (ts2 > lastReadingTs) {
+        appendReadingPoint(reading, ts2);
+        lastReadingTs = ts2;
+      }
     }
     const out = document.getElementById("meterResult");
     if (out && j?.result) out.textContent = JSON.stringify(j.result, null, 2);

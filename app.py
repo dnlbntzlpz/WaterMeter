@@ -34,6 +34,7 @@ import re
 import time
 import secrets
 from pathlib import Path
+from datetime import datetime, timedelta
 from threading import Lock
 from typing import Any, Dict, Optional, Tuple
 import threading
@@ -94,6 +95,9 @@ class Config:
     AUTOCYCLE_ENABLED: bool = os.getenv("AUTOCYCLE_ENABLED", "true").strip().lower() == "true"
     AUTOCYCLE_MIN_MIN: int = int(os.getenv("AUTOCYCLE_MIN_MIN", "20"))
     AUTOCYCLE_MAX_MIN: int = int(os.getenv("AUTOCYCLE_MAX_MIN", "60"))
+    QUIET_HOURS_ENABLED: bool = os.getenv("QUIET_HOURS_ENABLED", "true").strip().lower() == "true"
+    QUIET_START_HOUR: int = int(os.getenv("QUIET_START_HOUR", "20"))  # 20:00 local
+    QUIET_END_HOUR: int = int(os.getenv("QUIET_END_HOUR", "9"))       # 09:00 local
 
 
 # Shared prompt for water meter OCR across endpoints
@@ -239,6 +243,32 @@ def _autocycle_worker():
     max_m = max(min_m, int(app.config["AUTOCYCLE_MAX_MIN"]))
     logger.info("Auto-cycle: enabled (min=%sm, max=%sm)", min_m, max_m)
 
+    def is_quiet_now():
+        if not app.config.get("QUIET_HOURS_ENABLED", False):
+            return False
+        now = datetime.now()
+        start = int(app.config["QUIET_START_HOUR"]) % 24
+        end = int(app.config["QUIET_END_HOUR"]) % 24
+        h = now.hour
+        if start < end:
+            return start <= h < end
+        else:
+            # window crosses midnight
+            return h >= start or h < end
+
+    def seconds_until_quiet_end():
+        if not app.config.get("QUIET_HOURS_ENABLED", False):
+            return 0
+        now = datetime.now()
+        end_h = int(app.config["QUIET_END_HOUR"]) % 24
+        quiet = is_quiet_now()
+        if not quiet:
+            return 0
+        end_dt = now.replace(hour=end_h, minute=0, second=0, microsecond=0)
+        if end_dt <= now:
+            end_dt += timedelta(days=1)
+        return max(0, int((end_dt - now).total_seconds()))
+
     while True:
         try:
             wait_min = random.randint(min_m, max_m)
@@ -247,9 +277,24 @@ def _autocycle_worker():
             # Sleep in chunks to avoid very long sleeps
             remaining = wait_sec
             while remaining > 0:
+                # If we enter quiet hours, pause until they end
+                q = seconds_until_quiet_end()
+                if q > 0:
+                    logger.info("Auto-cycle: in quiet hours, pausing %ss", q)
+                    # sleep in small chunks during quiet as well
+                    while q > 0:
+                        sl = min(30, q)
+                        time.sleep(sl)
+                        q -= sl
+                    continue
                 chunk = min(30, remaining)
                 time.sleep(chunk)
                 remaining -= chunk
+
+            # Before triggering, ensure we are not within quiet window
+            if seconds_until_quiet_end() > 0:
+                logger.info("Auto-cycle: skipped trigger due to quiet hours")
+                continue
 
             with CAP_LOCK:
                 seq = _bump_relay_seq_locked()
